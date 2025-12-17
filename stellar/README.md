@@ -5,8 +5,7 @@
 [![Live Demo](https://img.shields.io/badge/🚀_Live_Demo-stellar--wine.vercel.app-00d4ff?style=for-the-badge)](https://stellar-wine.vercel.app)
 [![GitHub](https://img.shields.io/badge/GitHub-Stellar--v1k-181717?style=for-the-badge&logo=github)](https://github.com/diiviikk5/Stellar-v1k)
 
-> **Team STELLAR** | Dronacharya College of Engineering  
-> Divik Arora • Harsh Dixit • Ansh Kaushik | Mentor: Ms. Vimmi Malhotra
+
 
 ![STELLAR Banner](./public/banner.png)
 
