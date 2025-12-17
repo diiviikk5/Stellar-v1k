@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, lazy, Suspense } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
@@ -13,11 +13,16 @@ import {
     CpuChipIcon,
     BoltIcon
 } from '@heroicons/react/24/outline';
-import { Header, KPICard, EvidenceStrip, LoadingSpinner, StatusBadge, LiveTelemetryPanel, SpaceLiveFeeds, LiveSatelliteMap } from '../components';
+import { Header, KPICard, EvidenceStrip, LoadingSpinner, StatusBadge, DashboardLoader } from '../components';
 import { satellites, generateKPIMetrics, modelComparison } from '../data/mockData';
 import { initializeAI, generateForecast, getAIStatus } from '../services/aiService';
 import { generateHistoricalData } from '../services/liveDataService';
 import { useAppStore } from '../store/appStore';
+
+// Lazy load heavy components to improve initial load
+const LiveTelemetryPanel = lazy(() => import('../components/LiveTelemetryPanel'));
+const LiveSatelliteMap = lazy(() => import('../components/LiveSatelliteMap'));
+const SpaceLiveFeeds = lazy(() => import('../components/SpaceLiveFeeds'));
 
 const CommandDeck = () => {
     const navigate = useNavigate();
@@ -28,10 +33,12 @@ const CommandDeck = () => {
     const [aiReady, setAiReady] = useState(false);
     const [forecastResults, setForecastResults] = useState(null);
     const [inferenceTime, setInferenceTime] = useState(null);
+    const [isLoading, setIsLoading] = useState(true);
+    const [showHeavyComponents, setShowHeavyComponents] = useState(false);
 
     const addNotification = useAppStore(state => state.addNotification);
 
-    // Initialize AI on mount
+    // Initialize AI on mount (during loading screen)
     useEffect(() => {
         const init = async () => {
             try {
@@ -48,6 +55,22 @@ const CommandDeck = () => {
         setMetrics(generateKPIMetrics());
         const timer = setInterval(() => setCurrentTime(new Date()), 1000);
         return () => clearInterval(timer);
+    }, []);
+
+    // Delay heavy component loading after main UI is ready
+    useEffect(() => {
+        if (!isLoading) {
+            // Wait 2 seconds after loader completes before showing heavy components
+            const heavyTimer = setTimeout(() => {
+                setShowHeavyComponents(true);
+            }, 2000);
+            return () => clearTimeout(heavyTimer);
+        }
+    }, [isLoading]);
+
+    // Handle loading complete
+    const handleLoadingComplete = useCallback(() => {
+        setIsLoading(false);
     }, []);
 
     // Real AI-powered forecast
@@ -95,6 +118,11 @@ const CommandDeck = () => {
     const formatLastUpdate = () => {
         return currentTime.toLocaleTimeString();
     };
+
+    // Show loading screen
+    if (isLoading) {
+        return <DashboardLoader onComplete={handleLoadingComplete} />;
+    }
 
     if (!metrics) return null;
 
@@ -463,14 +491,52 @@ const CommandDeck = () => {
                     ))}
                 </div>
 
-                {/* Live Telemetry Panel */}
-                <LiveTelemetryPanel satellites={satellites} />
+                {/* Live Telemetry Panel - Lazy loaded */}
+                {showHeavyComponents && (
+                    <Suspense fallback={
+                        <div className="console-panel p-8 flex items-center justify-center">
+                            <LoadingSpinner text="Loading Live Telemetry..." />
+                        </div>
+                    }>
+                        <LiveTelemetryPanel satellites={satellites} />
+                    </Suspense>
+                )}
 
-                {/* Live Satellite Map */}
-                <LiveSatelliteMap satellites={satellites} />
+                {/* Live Satellite Map - Lazy loaded */}
+                {showHeavyComponents && (
+                    <Suspense fallback={
+                        <div className="console-panel p-8 flex items-center justify-center h-96">
+                            <LoadingSpinner text="Loading 3D Satellite Map..." />
+                        </div>
+                    }>
+                        <LiveSatelliteMap satellites={satellites} />
+                    </Suspense>
+                )}
 
-                {/* Space Live Feeds */}
-                <SpaceLiveFeeds />
+                {/* Space Live Feeds - Lazy loaded */}
+                {showHeavyComponents && (
+                    <Suspense fallback={
+                        <div className="console-panel p-8 flex items-center justify-center">
+                            <LoadingSpinner text="Loading Space Feeds..." />
+                        </div>
+                    }>
+                        <SpaceLiveFeeds />
+                    </Suspense>
+                )}
+
+                {/* Loading indicator for heavy components */}
+                {!showHeavyComponents && (
+                    <motion.div
+                        className="console-panel p-8 text-center"
+                        initial={{ opacity: 0 }}
+                        animate={{ opacity: 1 }}
+                    >
+                        <LoadingSpinner text="Loading additional modules..." />
+                        <p className="text-xs text-slate-500 mt-4">
+                            Live telemetry, satellite map, and space feeds loading...
+                        </p>
+                    </motion.div>
+                )}
 
                 {/* Evidence Strip */}
                 <EvidenceStrip
