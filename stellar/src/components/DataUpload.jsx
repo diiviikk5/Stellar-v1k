@@ -409,25 +409,25 @@ const DataUpload = ({ onDataLoaded }) => {
                                         <div className="flex justify-between items-center">
                                             <span className="text-[9px] font-mono text-slate-500">MEAN</span>
                                             <span className="text-xs font-mono font-black text-white">
-                                                {statistics.features[feature]?.mean?.toFixed(4) || '0.0000'}
+                                                {statistics.features?.[feature]?.mean?.toFixed(4) || '0.0000'}
                                             </span>
                                         </div>
                                         <div className="flex justify-between items-center">
                                             <span className="text-[9px] font-mono text-slate-500">STD</span>
                                             <span className="text-xs font-mono font-black text-slate-300">
-                                                {statistics.features[feature]?.std?.toFixed(4) || '0.0000'}
+                                                {statistics.features?.[feature]?.std?.toFixed(4) || '0.0000'}
                                             </span>
                                         </div>
                                         <div className="flex justify-between items-center">
                                             <span className="text-[9px] font-mono text-slate-500">RANGE</span>
                                             <span className="text-xs font-mono font-black text-slate-300">
-                                                {statistics.features[feature]?.range?.toFixed(4) || '0.0000'}
+                                                {statistics.features?.[feature]?.range?.toFixed(4) || '0.0000'}
                                             </span>
                                         </div>
                                         <div className="flex justify-between items-center">
                                             <span className="text-[9px] font-mono text-slate-500">OUTLIERS</span>
-                                            <span className={`text-xs font-mono font-black ${statistics.features[feature]?.outlierCount > 0 ? 'text-rose-400' : 'text-emerald-400'}`}>
-                                                {statistics.features[feature]?.outlierCount || 0}
+                                            <span className={`text-xs font-mono font-black ${statistics.features?.[feature]?.outlierCount > 0 ? 'text-rose-400' : 'text-emerald-400'}`}>
+                                                {statistics.features?.[feature]?.outlierCount || 0}
                                             </span>
                                         </div>
                                     </div>
