@@ -15,10 +15,11 @@ import * as tf from '@tensorflow/tfjs';
 let isModelReady = false;
 let forecastModel = null;
 let anomalyModel = null;
+let isTraining = false;
 
 // Model configuration
 const CONFIG = {
-    sequenceLength: 96, // 24 hours at 15-min intervals
+    sequenceLength: 48, // Reduced from 96 to work with limited data (12 hours at 15-min intervals)
     predictionHorizons: [1, 2, 4, 8, 16, 24, 48, 96], // 15m to 24h
     features: 4, // clock, radial, along-track, cross-track
     hiddenUnits: 64,
@@ -51,17 +52,20 @@ export async function initializeAI() {
 
 /**
  * Create a Transformer-LSTM hybrid forecasting model
- * Simplified but functional for demo
+ * Enhanced architecture with dropout and better capacity
  */
 function createForecastModel() {
     const model = tf.sequential();
 
     // Input layer - expects [batch, sequence, features]
     model.add(tf.layers.lstm({
-        units: CONFIG.lstmUnits,
+        units: 64,  // Increased from 32
         inputShape: [CONFIG.sequenceLength, CONFIG.features],
         returnSequences: true,
-        kernelInitializer: 'glorotUniform'
+        kernelInitializer: 'glorotUniform',
+        recurrentInitializer: 'glorotUniform',
+        dropout: 0.2,  // Add dropout for regularization
+        recurrentDropout: 0.2
     }));
 
     // Attention-like mechanism via dense layers
@@ -69,28 +73,49 @@ function createForecastModel() {
         layer: tf.layers.dense({ units: CONFIG.hiddenUnits, activation: 'relu' })
     }));
 
-    // Bidirectional LSTM for temporal patterns
+    // Add dropout after attention
+    model.add(tf.layers.dropout({ rate: 0.3 }));
+
+    // Second LSTM layer for deeper temporal patterns
     model.add(tf.layers.lstm({
-        units: CONFIG.lstmUnits,
-        returnSequences: false,
-        goBackwards: false
+        units: 64,  // Increased from 32
+        returnSequences: true,
+        recurrentInitializer: 'glorotUniform',
+        dropout: 0.2,
+        recurrentDropout: 0.2
     }));
 
-    // Multi-horizon prediction head
+    // Final LSTM layer
+    model.add(tf.layers.lstm({
+        units: 32,
+        returnSequences: false,
+        recurrentInitializer: 'glorotUniform'
+    }));
+
+    // Multi-horizon prediction head with more capacity
     model.add(tf.layers.dense({
-        units: CONFIG.hiddenUnits,
+        units: 128,  // Increased from 64
+        activation: 'relu'
+    }));
+    
+    model.add(tf.layers.dropout({ rate: 0.3 }));
+
+    model.add(tf.layers.dense({
+        units: 64,
         activation: 'relu'
     }));
 
-    // Output: predictions for all horizons + uncertainty estimates
+    // Output: predictions for ALL features across ALL horizons
+    // [radial_h1, along_h1, cross_h1, clock_h1, radial_h2, ...] for 8 horizons = 32 outputs
     model.add(tf.layers.dense({
-        units: CONFIG.predictionHorizons.length * 2, // mean + std for each horizon
+        units: CONFIG.features * CONFIG.predictionHorizons.length,
         activation: 'linear'
     }));
 
     model.compile({
         optimizer: tf.train.adam(0.001),
-        loss: 'meanSquaredError'
+        loss: 'meanSquaredError',
+        metrics: ['mae']
     });
 
     return model;
@@ -187,6 +212,587 @@ export async function generateForecast(historicalData, satelliteId) {
         timestamp: new Date().toISOString()
     };
 }
+
+/**
+ * Train the model on provided ISRO data
+ * @param {Array} data - Array of {clock, radial, along, cross} objects
+ * @param {Function} onEpochEnd - Callback for training progress
+ */
+export async function trainModel(data, onEpochEnd) {
+    if (!isModelReady) await initializeAI();
+    if (isTraining) return false;
+
+    isTraining = true;
+    console.log(`🧠 Starting training on ${data.length} data points...`);
+
+    // Prepare training tensors
+    const sequences = [];
+    const targets = [];
+
+    // Adapt to available data - use shorter horizons if needed
+    const availableSteps = data.length - CONFIG.sequenceLength;
+    const usableHorizons = CONFIG.predictionHorizons.filter(h => h <= availableSteps);
+    
+    if (usableHorizons.length === 0) {
+        console.error(`❌ Need at least ${CONFIG.sequenceLength + 1} data points, have ${data.length}`);
+        isTraining = false;
+        return false;
+    }
+
+    console.log(`📉 Using ${usableHorizons.length}/${CONFIG.predictionHorizons.length} horizons based on data availability`);
+
+    // Create sliding window sequences with PROPER multi-horizon targets
+    for (let i = 0; i <= data.length - CONFIG.sequenceLength - 1; i++) {
+        const seq = data.slice(i, i + CONFIG.sequenceLength).map(d => [
+            d.clock, d.radial, d.along, d.cross
+        ]);
+
+        sequences.push(seq);
+
+        // FIXED: Create proper multi-horizon targets for ALL features
+        const targetVector = [];
+        
+        for (const horizon of usableHorizons) {
+            const futureIdx = i + CONFIG.sequenceLength + horizon - 1;
+            
+            if (futureIdx < data.length) {
+                const futurePoint = data[futureIdx];
+                // Add all 4 features for this horizon: [radial, along, cross, clock]
+                targetVector.push(
+                    futurePoint.radial,
+                    futurePoint.along,
+                    futurePoint.cross,
+                    futurePoint.clock
+                );
+            } else {
+                // If we don't have data for this horizon, use last known values
+                const lastPoint = data[data.length - 1];
+                targetVector.push(
+                    lastPoint.radial,
+                    lastPoint.along,
+                    lastPoint.cross,
+                    lastPoint.clock
+                );
+            }
+        }
+        
+        // Pad with zeros if we're using fewer horizons than the model expects
+        while (targetVector.length < CONFIG.features * CONFIG.predictionHorizons.length) {
+            targetVector.push(0);
+        }
+        
+        targets.push(targetVector);
+    }
+
+    if (sequences.length === 0) {
+        console.error('❌ Not enough data for training sequences');
+        console.error(`   Need: ${CONFIG.sequenceLength + 1}+ points`);
+        console.error(`   Have: ${data.length} points`);
+        isTraining = false;
+        return false;
+    }
+
+    console.log(`📊 Created ${sequences.length} training sequences`);
+    console.log(`🎯 Predicting ${usableHorizons.length} horizons: ${usableHorizons.join(', ')} steps ahead`);
+
+    const xs = tf.tensor3d(sequences);
+    const ys = tf.tensor2d(targets);
+
+    try {
+        await forecastModel.fit(xs, ys, {
+            epochs: 50, // Increased from 5 to 50 epochs
+            batchSize: 32,
+            shuffle: true,
+            validationSplit: 0.2, // 20% validation split
+            callbacks: {
+                onEpochEnd: (epoch, logs) => {
+                    if (onEpochEnd) {
+                        onEpochEnd(epoch, logs.loss, logs.val_loss);
+                    }
+                    console.log(`Epoch ${epoch + 1}/50: loss=${logs.loss.toFixed(4)}, val_loss=${logs.val_loss?.toFixed(4) || 'N/A'}`);
+                }
+            }
+        });
+        console.log('✅ Training completed successfully');
+    } catch (err) {
+        console.error('❌ Training error:', err);
+    } finally {
+        xs.dispose();
+        ys.dispose();
+        isTraining = false;
+    }
+
+    return true;
+}
+
+/**
+ * Train model with full configuration and validation
+ * @param {Array} data - Training data array
+ * @param {Object} config - Training configuration
+ * @param {Object} callbacks - Callback functions
+ * @returns {Object} Training results with history
+ */
+export async function trainWithConfig(data, config = {}, callbacks = {}) {
+    if (!isModelReady) await initializeAI();
+    if (isTraining) {
+        throw new Error('Training already in progress');
+    }
+
+    isTraining = true;
+
+    const {
+        epochs = 100,  // Increased default from 50 to 100
+        batchSize = 32,
+        learningRate = 0.001,
+        validationSplit = 0.2,
+        sequenceLength = CONFIG.sequenceLength,
+        predictionHorizons = CONFIG.predictionHorizons,
+        earlyStopping = true,  // Enable early stopping
+        patience = 10  // Stop if no improvement for 10 epochs
+    } = config;
+
+    const {
+        onEpochEnd = () => {},
+        onBatchEnd = () => {},
+        onProgress = () => {},
+        onComplete = () => {}
+    } = callbacks;
+
+    const startTime = Date.now();
+    console.log(`🧠 Enhanced Training Configuration:`);
+    console.log(`   📊 Data: ${data.length} samples`);
+    console.log(`   🔄 Epochs: ${epochs} (early stopping: ${earlyStopping})`);
+    console.log(`   📦 Batch Size: ${batchSize}`);
+    console.log(`   📚 Validation Split: ${(validationSplit * 100).toFixed(0)}%`);
+    console.log(`   🎓 Learning Rate: ${learningRate}`);
+
+    try {
+        // Normalize data
+        const { normalized: normData, normalizationParams } = normalizeDataForTraining(data);
+
+        // Prepare sequences and targets
+        const sequences = [];
+        const targets = [];
+
+        for (let i = 0; i <= normData.length - sequenceLength - predictionHorizons[0]; i++) {
+            const seq = normData.slice(i, i + sequenceLength).map(d => [
+                d.clock, d.radial, d.along, d.cross
+            ]);
+
+            // Multi-horizon target: predict all features for each horizon
+            const targetVector = [];
+            predictionHorizons.forEach(horizon => {
+                const targetPoint = normData[i + sequenceLength + horizon - 1];
+                targetVector.push(
+                    targetPoint.clock,
+                    targetPoint.radial,
+                    targetPoint.along,
+                    targetPoint.cross
+                );
+            });
+
+            sequences.push(seq);
+            targets.push(targetVector);
+        }
+
+        if (sequences.length === 0) {
+            throw new Error('Not enough data to create training sequences');
+        }
+
+        // Split into train and validation
+        const splitIndex = Math.floor(sequences.length * (1 - validationSplit));
+        const trainSequences = sequences.slice(0, splitIndex);
+        const trainTargets = targets.slice(0, splitIndex);
+        const valSequences = sequences.slice(splitIndex);
+        const valTargets = targets.slice(splitIndex);
+
+        const xsTrain = tf.tensor3d(trainSequences);
+        const ysTrain = tf.tensor2d(trainTargets);
+        const xsVal = valSequences.length > 0 ? tf.tensor3d(valSequences) : null;
+        const ysVal = valTargets.length > 0 ? tf.tensor2d(valTargets) : null;
+
+        // Reconfigure model with custom optimizer
+        const optimizer = tf.train.adam(learningRate);
+        forecastModel.compile({
+            optimizer,
+            loss: 'meanSquaredError',
+            metrics: ['mse']
+        });
+
+        const history = {
+            epoch: [],
+            trainLoss: [],
+            valLoss: [],
+            trainRMSE: [],
+            valRMSE: [],
+            timestamp: []
+        };
+
+        // Early stopping state
+        let bestValLoss = Infinity;
+        let epochsWithoutImprovement = 0;
+        let stoppedEarly = false;
+
+        await forecastModel.fit(xsTrain, ysTrain, {
+            epochs,
+            batchSize,
+            validationData: xsVal ? [xsVal, ysVal] : null,
+            shuffle: true,
+            callbacks: {
+                onEpochEnd: async (epoch, logs) => {
+                    const trainRMSEValue = Math.sqrt(logs.loss);
+                    const valRMSEValue = logs.val_loss ? Math.sqrt(logs.val_loss) : null;
+
+                    history.epoch.push(epoch + 1);
+                    history.trainLoss.push(logs.loss);
+                    history.valLoss.push(logs.val_loss || null);
+                    history.trainRMSE.push(trainRMSEValue);
+                    history.valRMSE.push(valRMSEValue);
+                    history.timestamp.push(Date.now());
+
+                    // Early stopping logic
+                    if (earlyStopping && logs.val_loss !== undefined) {
+                        if (logs.val_loss < bestValLoss) {
+                            bestValLoss = logs.val_loss;
+                            epochsWithoutImprovement = 0;
+                        } else {
+                            epochsWithoutImprovement++;
+                            if (epochsWithoutImprovement >= patience) {
+                                console.log(`⏸️  Early stopping at epoch ${epoch + 1}: no improvement for ${patience} epochs`);
+                                stoppedEarly = true;
+                                forecastModel.stopTraining = true;
+                            }
+                        }
+                    }
+
+                    onEpochEnd(epoch + 1, logs, {
+                        trainRMSE: trainRMSEValue,
+                        valRMSE: valRMSEValue,
+                        stoppedEarly,
+                        epochsWithoutImprovement
+                    });
+
+                    onProgress({
+                        epoch: epoch + 1,
+                        totalEpochs: epochs,
+                        progress: ((epoch + 1) / epochs) * 100,
+                        trainLoss: logs.loss,
+                        valLoss: logs.val_loss,
+                        stoppedEarly
+                    });
+
+                    // Memory cleanup
+                    if (epoch % 10 === 0) {
+                        await tf.nextFrame();
+                    }
+                },
+                onBatchEnd: (batch, logs) => {
+                    onBatchEnd(batch, logs);
+                }
+            }
+        });
+
+        const trainingDuration = Date.now() - startTime;
+
+        // Calculate final metrics
+        const finalMetrics = {
+            bestEpoch: history.epoch[history.trainLoss.indexOf(Math.min(...history.trainLoss))],
+            bestTrainLoss: Math.min(...history.trainLoss),
+            bestValLoss: history.valLoss.length > 0 ? Math.min(...history.valLoss.filter(v => v !== null)) : null,
+            finalTrainLoss: history.trainLoss[history.trainLoss.length - 1],
+            finalValLoss: history.valLoss.length > 0 ? history.valLoss[history.valLoss.length - 1] : null,
+            trainingDuration,
+            trainingDurationFormatted: formatDuration(trainingDuration)
+        };
+
+        onComplete(finalMetrics, history);
+
+        return {
+            success: true,
+            history,
+            metrics: finalMetrics,
+            normalizationParams,
+            model: forecastModel
+        };
+
+    } catch (error) {
+        console.error('Training error:', error);
+        isTraining = false;
+        throw error;
+    } finally {
+        isTraining = false;
+    }
+}
+
+/**
+ * Normalize data for training
+ */
+function normalizeDataForTraining(data) {
+    const features = ['clock', 'radial', 'along', 'cross'];
+    const means = {};
+    const stds = {};
+
+    features.forEach(feature => {
+        const values = data.map(d => d[feature]);
+        means[feature] = values.reduce((a, b) => a + b, 0) / values.length;
+        const variance = values.reduce((sum, v) => sum + Math.pow(v - means[feature], 2), 0) / values.length;
+        stds[feature] = Math.sqrt(variance) || 1;
+    });
+
+    const normalized = data.map(point => ({
+        ...point,
+        clock: (point.clock - means.clock) / stds.clock,
+        radial: (point.radial - means.radial) / stds.radial,
+        along: (point.along - means.along) / stds.along,
+        cross: (point.cross - means.cross) / stds.cross
+    }));
+
+    return { normalized, normalizationParams: { means, stds } };
+}
+
+/**
+ * Format duration in milliseconds to human readable format
+ */
+function formatDuration(ms) {
+    const seconds = Math.floor(ms / 1000);
+    const minutes = Math.floor(seconds / 60);
+    const hours = Math.floor(minutes / 60);
+
+    if (hours > 0) {
+        return `${hours}h ${minutes % 60}m ${seconds % 60}s`;
+    } else if (minutes > 0) {
+        return `${minutes}m ${seconds % 60}s`;
+    }
+    return `${seconds}s`;
+}
+
+/**
+ * Evaluate model on test data
+ * @param {Array} testData - Test data array
+ * @param {Object} normalizationParams - Normalization parameters
+ * @returns {Object} Evaluation metrics
+ */
+export async function evaluateModel(testData, normalizationParams) {
+    if (!isModelReady) {
+        await initializeAI();
+    }
+
+    const { means, stds } = normalizationParams;
+    const sequenceLength = CONFIG.sequenceLength;
+
+    // Prepare test sequences
+    const sequences = [];
+    const actualValues = [];
+
+    for (let i = 0; i <= testData.length - sequenceLength - 1; i++) {
+        const seq = testData.slice(i, i + sequenceLength).map(d => [
+            (d.clock - means.clock) / stds.clock,
+            (d.radial - means.radial) / stds.radial,
+            (d.along - means.along) / stds.along,
+            (d.cross - means.cross) / stds.cross
+        ]);
+
+        const actual = testData[i + sequenceLength];
+        actualValues.push(actual);
+        sequences.push(seq);
+    }
+
+    const xs = tf.tensor3d(sequences);
+    const predictions = await forecastModel.predict(xs).data();
+
+    xs.dispose();
+
+    // Process predictions and calculate metrics
+    const processedPredictions = [];
+    const metrics = {
+        radial: { rmse: 0, mae: 0, r2: 0 },
+        along: { rmse: 0, mae: 0, r2: 0 },
+        cross: { rmse: 0, mae: 0, r2: 0 },
+        clock: { rmse: 0, mae: 0, r2: 0 }
+    };
+
+    // Process predictions (first 4 values correspond to first horizon prediction)
+    for (let i = 0; i < actualValues.length; i++) {
+        const predClock = predictions[i * 4] * stds.clock + means.clock;
+        const predRadial = predictions[i * 4 + 1] * stds.radial + means.radial;
+        const predAlong = predictions[i * 4 + 2] * stds.along + means.along;
+        const predCross = predictions[i * 4 + 3] * stds.cross + means.cross;
+
+        const actual = actualValues[i];
+
+        processedPredictions.push({
+            timestamp: actual.timestamp,
+            utc_time: actual.utc_time,
+            actual: {
+                clock: actual.clock,
+                radial: actual.radial,
+                along: actual.along,
+                cross: actual.cross
+            },
+            predicted: {
+                clock: predClock,
+                radial: predRadial,
+                along: predAlong,
+                cross: predCross
+            },
+            errors: {
+                clock: actual.clock - predClock,
+                radial: actual.radial - predRadial,
+                along: actual.along - predAlong,
+                cross: actual.cross - predCross
+            }
+        });
+    }
+
+    // Calculate metrics for each feature
+    ['radial', 'along', 'cross', 'clock'].forEach(feature => {
+        const errors = processedPredictions.map(p => p.errors[feature]);
+        const actuals = processedPredictions.map(p => p.actual[feature]);
+        const preds = processedPredictions.map(p => p.predicted[feature]);
+
+        // RMSE
+        const rmse = Math.sqrt(errors.reduce((sum, e) => sum + e * e, 0) / errors.length);
+        metrics[feature].rmse = rmse;
+
+        // MAE
+        const mae = errors.reduce((sum, e) => sum + Math.abs(e), 0) / errors.length;
+        metrics[feature].mae = mae;
+
+        // R²
+        const actualMean = actuals.reduce((sum, a) => sum + a, 0) / actuals.length;
+        const ssTot = actuals.reduce((sum, a) => sum + Math.pow(a - actualMean, 2), 0);
+        const ssRes = errors.reduce((sum, e) => sum + e * e, 0);
+        metrics[feature].r2 = 1 - (ssRes / ssTot);
+    });
+
+    // Overall metrics
+    const overallRMSE = Math.sqrt(
+        Object.values(metrics).reduce((sum, m) => sum + m.rmse * m.rmse, 0) / 4
+    );
+    const overallMAE = Object.values(metrics).reduce((sum, m) => sum + m.mae, 0) / 4;
+    const overallR2 = Object.values(metrics).reduce((sum, m) => sum + m.r2, 0) / 4;
+
+    return {
+        predictions: processedPredictions,
+        metrics: {
+            overall: { rmse: overallRMSE, mae: overallMAE, r2: overallR2 },
+            ...metrics
+        },
+        featureRMSE: {
+            radial: metrics.radial.rmse,
+            along: metrics.along.rmse,
+            cross: metrics.cross.rmse,
+            clock: metrics.clock.rmse
+        },
+        mae: overallMAE,
+        r2: overallR2,
+        rmse: overallRMSE,
+        mape: calculateMAPE(processedPredictions)
+    };
+}
+
+/**
+ * Calculate Mean Absolute Percentage Error
+ */
+function calculateMAPE(predictions) {
+    let totalMAPE = 0;
+    let count = 0;
+
+    predictions.forEach(p => {
+        ['radial', 'along', 'cross', 'clock'].forEach(feature => {
+            const actual = p.actual[feature];
+            const predicted = p.predicted[feature];
+            if (Math.abs(actual) > 0.001) {
+                totalMAPE += Math.abs((actual - predicted) / actual) * 100;
+                count++;
+            }
+        });
+    });
+
+    return count > 0 ? totalMAPE / count : 0;
+}
+
+/**
+ * Create a fresh model for new training
+ */
+export function createFreshModel(config = {}) {
+    const {
+        sequenceLength = CONFIG.sequenceLength,
+        features = CONFIG.features,
+        hiddenUnits = CONFIG.hiddenUnits,
+        lstmUnits = CONFIG.lstmUnits
+    } = config;
+
+    const model = tf.sequential();
+
+    model.add(tf.layers.lstm({
+        units: lstmUnits,
+        inputShape: [sequenceLength, features],
+        returnSequences: true,
+        kernelInitializer: 'glorotUniform',
+        recurrentInitializer: 'glorotUniform'
+    }));
+
+    model.add(tf.layers.timeDistributed({
+        layer: tf.layers.dense({ units: hiddenUnits, activation: 'relu' })
+    }));
+
+    model.add(tf.layers.lstm({
+        units: lstmUnits,
+        returnSequences: false,
+        goBackwards: false,
+        recurrentInitializer: 'glorotUniform'
+    }));
+
+    model.add(tf.layers.dense({
+        units: hiddenUnits,
+        activation: 'relu'
+    }));
+
+    model.add(tf.layers.dense({
+        units: 16,
+        activation: 'linear'
+    }));
+
+    return model;
+}
+
+/**
+ * Predict future errors based on recent data
+ * @param {Array} recentData - Last 96 data points
+ */
+export async function predictFuture(recentData) {
+    if (!isModelReady) await initializeAI();
+
+    // Prepare input
+    const inputSeq = recentData.slice(-CONFIG.sequenceLength).map(d => [
+        d.clock, d.radial, d.along, d.cross
+    ]);
+
+    // Need batch dimension [1, 96, 4]
+    const inputTensor = tf.tensor3d([inputSeq]);
+
+    const predictionTensor = forecastModel.predict(inputTensor);
+    const predictionData = await predictionTensor.data();
+
+    inputTensor.dispose();
+    predictionTensor.dispose();
+
+    // Parse output (flat array of mean/std pairs for each horizon)
+    // Structure: [mean1, std1, mean2, std2, ...]
+    const result = {
+        clock: predictionData[0], // Simplified mapping
+        radial: predictionData[1],
+        along: predictionData[2],
+        cross: predictionData[3],
+        uncertainty: predictionData[4]
+    };
+
+    return result;
+}
+
+export { isModelReady };
+
 
 /**
  * Prepare sequence data for model input
@@ -374,7 +980,9 @@ export function* streamingPredictions(baseData, updateIntervalMs = 1000) {
             radial: lastPoint.radial + (Math.random() - 0.5) * 0.05,
             along: lastPoint.along + (Math.random() - 0.5) * 0.08,
             cross: lastPoint.cross + (Math.random() - 0.5) * 0.03,
-            timestamp: new Date()
+            timestamp: Date.now(),
+            utc_time: new Date().toLocaleString('en-US', { hour12: false }),
+            clockMeters: (lastPoint.clock + (Math.random() - 0.5) * 0.1) * 0.3
         };
 
         currentData.push(newPoint);
