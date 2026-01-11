@@ -29,3 +29,9 @@ HACKATHON_PITCH.md
 STELLAR_PPT_Outline.md
 STELLAR_Project_Abstract.md
 IMPROVEMENTS_MADE.md
+
+# Python virtual environment
+.env/
+
+# Gemini browser profile
+.gemini/

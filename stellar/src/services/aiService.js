@@ -373,8 +373,11 @@ export async function trainWithConfig(data, config = {}, callbacks = {}) {
         // Prepare sequences and targets
         const sequences = [];
         const targets = [];
+        
+        // Use max horizon to ensure we don't go out of bounds
+        const maxHorizon = Math.max(...predictionHorizons);
 
-        for (let i = 0; i <= normData.length - sequenceLength - predictionHorizons[0]; i++) {
+        for (let i = 0; i <= normData.length - sequenceLength - maxHorizon; i++) {
             const seq = normData.slice(i, i + sequenceLength).map(d => [
                 d.clock, d.radial, d.along, d.cross
             ]);
@@ -383,6 +386,7 @@ export async function trainWithConfig(data, config = {}, callbacks = {}) {
             const targetVector = [];
             predictionHorizons.forEach(horizon => {
                 const targetPoint = normData[i + sequenceLength + horizon - 1];
+                if (!targetPoint) return; // Safety check
                 targetVector.push(
                     targetPoint.clock,
                     targetPoint.radial,
@@ -390,9 +394,11 @@ export async function trainWithConfig(data, config = {}, callbacks = {}) {
                     targetPoint.cross
                 );
             });
-
-            sequences.push(seq);
-            targets.push(targetVector);
+            
+            if (targetVector.length === predictionHorizons.length * 4) {
+                sequences.push(seq);
+                targets.push(targetVector);
+            }
         }
 
         if (sequences.length === 0) {
