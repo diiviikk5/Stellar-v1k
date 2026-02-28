@@ -72,7 +72,7 @@ const AIAssistant = ({ context = {} }) => {
                         'Authorization': `Bearer ${MINIMAX_KEY}`
                     },
                     body: JSON.stringify({
-                        model: 'MiniMax-M1',
+                        model: 'abab6.5s-chat', // MiniMax's actual API model string for the M2.5/abab6.5 series
                         messages: [
                             {
                                 role: 'system',
